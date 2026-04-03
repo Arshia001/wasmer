@@ -12,7 +12,7 @@ use std::{path::Path, sync::Arc};
 pub struct MountPoint {
     pub path: PathBuf,
     pub name: String,
-    pub fs: Arc<Box<dyn FileSystem + Send + Sync>>,
+    pub fs: Arc<dyn FileSystem + Send + Sync>,
 }
 
 impl MountPoint {
@@ -73,7 +73,26 @@ impl UnionFileSystem {
     /// Merge another UnionFileSystem into this one.
     pub fn merge(&self, other: &UnionFileSystem, mode: UnionMergeMode) -> Result<()> {
         for item in other.mounts.iter() {
-            if self.mounts.contains_key(item.key()) {
+            if let Some(existing) = self.mounts.get(item.key()) {
+                let existing_fs = existing.fs.clone();
+                drop(existing);
+
+                let existing_union = existing_fs
+                    .as_ref()
+                    .upcast_any_ref()
+                    .downcast_ref::<UnionFileSystem>();
+                let other_union = item
+                    .value()
+                    .fs
+                    .as_ref()
+                    .upcast_any_ref()
+                    .downcast_ref::<UnionFileSystem>();
+
+                if let (Some(existing_union), Some(other_union)) = (existing_union, other_union) {
+                    existing_union.merge(other_union, mode)?;
+                    continue;
+                }
+
                 match mode {
                     UnionMergeMode::Replace => {
                         self.mounts.insert(item.key().clone(), item.value().clone());
@@ -117,7 +136,7 @@ impl UnionFileSystem {
     fn find_mount(
         &self,
         path: PathBuf,
-    ) -> Option<(PathBuf, PathBuf, Arc<Box<dyn FileSystem + Send + Sync>>)> {
+    ) -> Option<(PathBuf, PathBuf, Arc<dyn FileSystem + Send + Sync>)> {
         let mut components = path.components().collect::<Vec<_>>();
 
         if let Some(c) = components.first().copied() {
@@ -321,7 +340,7 @@ impl FileSystem for UnionFileSystem {
                 Box::new(union)
             };
 
-            let fs = Arc::new(fs);
+            let fs: Arc<dyn FileSystem + Send + Sync> = Arc::from(fs);
 
             let mount = MountPoint {
                 path: PathBuf::from(c.as_os_str()),
@@ -378,7 +397,7 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use crate::{FileSystem as FileSystemTrait, FsError, UnionFileSystem, mem_fs};
+    use crate::{FileSystem as FileSystemTrait, FsError, UnionFileSystem, UnionMergeMode, mem_fs};
 
     use super::{FileOpener, OpenOptionsConfig};
 
@@ -564,6 +583,67 @@ mod tests {
             fs.symlink_metadata(&PathBuf::from("/app/b/data-b.txt"))
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_preserves_nested_root_mounts_with_skip() {
+        let primary = UnionFileSystem::new();
+        let openssl = mem_fs::FileSystem::default();
+        openssl.create_dir(Path::new("/certs")).unwrap();
+        openssl
+            .new_open_options()
+            .write(true)
+            .create_new(true)
+            .open(Path::new("/certs/ca.pem"))
+            .unwrap();
+        primary
+            .mount(
+                "openssl".to_string(),
+                Path::new("/openssl"),
+                Box::new(openssl),
+            )
+            .unwrap();
+
+        let injected = UnionFileSystem::new();
+        let app = mem_fs::FileSystem::default();
+        app.new_open_options()
+            .write(true)
+            .create_new(true)
+            .open(Path::new("/index.php"))
+            .unwrap();
+        injected
+            .mount("app".to_string(), Path::new("/app"), Box::new(app))
+            .unwrap();
+
+        let assets = mem_fs::FileSystem::default();
+        assets.create_dir(Path::new("/css")).unwrap();
+        assets
+            .new_open_options()
+            .write(true)
+            .create_new(true)
+            .open(Path::new("/css/site.css"))
+            .unwrap();
+        injected
+            .mount(
+                "assets".to_string(),
+                Path::new("/opt/assets"),
+                Box::new(assets),
+            )
+            .unwrap();
+
+        primary.merge(&injected, UnionMergeMode::Skip).unwrap();
+
+        let root_contents = read_dir_names(&primary, "/");
+        assert!(root_contents.contains(&"app".to_string()));
+        assert!(root_contents.contains(&"opt".to_string()));
+        assert!(root_contents.contains(&"openssl".to_string()));
+        assert!(primary.metadata(Path::new("/app/index.php")).is_ok());
+        assert!(
+            primary
+                .metadata(Path::new("/opt/assets/css/site.css"))
+                .is_ok()
+        );
+        assert!(primary.metadata(Path::new("/openssl/certs/ca.pem")).is_ok());
     }
 
     #[tokio::test]
