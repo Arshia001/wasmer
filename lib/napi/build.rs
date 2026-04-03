@@ -3,42 +3,50 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn download_v8() {
-    let url = match (
+fn download_and_cache_v8() {
+    let archive_filename = match (
         env::var("CARGO_CFG_TARGET_OS").unwrap().as_str(),
         env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str(),
         env::var("CARGO_CFG_TARGET_ENV")
             .unwrap_or_default()
             .as_str(),
     ) {
-        ("macos", "aarch64", _) => {
-            "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.2/v8-darwin-arm64.tar.xz"
-        }
-        ("macos", "x86_64", _) => {
-            "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.2/v8-darwin-amd64.tar.xz"
-        }
-        ("linux", "x86_64", "gnu") => {
-            "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.2/v8-linux-amd64.tar.xz"
-        }
-        ("linux", "x86_64", "musl") => {
-            "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.2/v8-linux-musl-amd64.tar.xz"
-        }
-        ("android", "aarch64", _) => {
-            "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.2/v8-android-arm64.tar.xz"
-        }
+        ("macos", "aarch64", _) => "v8-darwin-arm64.tar.xz",
+        ("macos", "x86_64", _) => "v8-darwin-amd64.tar.xz",
+        ("linux", "x86_64", "gnu") => "v8-linux-amd64.tar.xz",
+        ("linux", "x86_64", "musl") => "v8-linux-musl-amd64.tar.xz",
+        ("android", "aarch64", _) => "v8-android-arm64.tar.xz",
         (os, arch, _) => panic!("target os + arch combination not supported: {os}, {arch}"),
     };
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let url = format!(
+        "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.2/{archive_filename}"
+    );
 
-    let tar_data = ureq::get(url)
-        .call()
-        .expect("failed to download v8")
-        .body_mut()
-        .with_config()
-        .limit(50 * 1024 * 1024) // 50MB
-        .read_to_vec()
-        .expect("failed to download v8 lib");
+    let workspace_root_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../..")
+        .canonicalize()
+        .expect("canonicalize workspace path");
+    let cache_dir = workspace_root_dir.join("build-cache/v8/11.9.2");
+    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let cache_file = cache_dir.join(archive_filename);
+
+    let tar_data = if !cache_file.exists() {
+        let tar_data = ureq::get(url)
+            .call()
+            .expect("failed to download v8")
+            .body_mut()
+            .with_config()
+            .limit(50 * 1024 * 1024) // 50MB
+            .read_to_vec()
+            .expect("failed to download v8 lib");
+        std::fs::write(cache_file, &tar_data).expect("write cached v8 archive");
+        tar_data
+    } else {
+        std::fs::read(cache_file).expect("read cached v8 archive")
+    };
+
+    let out_dir = env::var("OUT_DIR").unwrap();
 
     let tar = xz::read::XzDecoder::new(tar_data.as_slice());
     let mut archive = tar::Archive::new(tar);
@@ -79,7 +87,7 @@ fn main() {
         if let (Ok(v8_include), Ok(v8_lib)) = (&v8_include, &v8_lib) {
             (PathBuf::from(v8_include), PathBuf::from(v8_lib))
         } else {
-            download_v8();
+            download_and_cache_v8();
             let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
             (out_dir.join("include"), out_dir.join("lib"))
         };
