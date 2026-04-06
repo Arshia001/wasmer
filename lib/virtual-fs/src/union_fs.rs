@@ -1,602 +1,599 @@
-//! Another implementation of the union that uses paths,
-//! its not as simple as TmpFs. not currently used but was used by
-//! the previoulsy implementation of Deploy - now using TmpFs
+//! VFS-inspired union filesystem that owns mount topology.
+//!
+//! `MountFileSystem` is the primary type. `UnionFileSystem` is a backward-compatible
+//! type alias kept for existing callers.
 
 use dashmap::DashMap;
 
 use crate::*;
 
-use std::{collections::HashSet, ffi::OsString, path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    ffi::OsString,
+    path::{Component, Path},
+    sync::{Arc, RwLock},
+};
 
-#[derive(Debug, Clone)]
-pub struct MountPoint {
-    pub path: PathBuf,
-    pub name: String,
-    pub fs: Option<Arc<dyn FileSystem + Send + Sync>>,
-    pub children: Option<Arc<UnionFileSystem>>,
+/// A single node in the mount tree.
+///
+/// A node represents one path component in the mount hierarchy.
+/// It may have a filesystem mounted at its exact path (`mount`),
+/// and zero or more child mount-points (`children`).
+///
+/// Using `Arc<MountNode>` as children values lets callers clone the `Arc`
+/// cheaply and drop the parent `DashMap` lock before recursing, which avoids
+/// holding multiple shard locks at once.
+pub struct MountNode {
+    mount: RwLock<Option<Arc<dyn FileSystem + Send + Sync>>>,
+    children: DashMap<OsString, Arc<MountNode>>,
 }
 
-impl MountPoint {
-    pub fn fs(&self) -> Option<&(dyn FileSystem + Send + Sync)> {
-        self.fs.as_deref()
+impl std::fmt::Debug for MountNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mounted = self.mount.read().map(|g| g.is_some()).unwrap_or(false);
+        let child_keys: Vec<OsString> = self.children.iter().map(|e| e.key().clone()).collect();
+        f.debug_struct("MountNode")
+            .field("mounted", &mounted)
+            .field("children", &child_keys)
+            .finish()
+    }
+}
+
+impl MountNode {
+    fn new() -> Self {
+        MountNode {
+            mount: RwLock::new(None),
+            children: DashMap::new(),
+        }
     }
 
-    pub fn mount_point_ref(&self) -> MountPointRef<'_> {
-        MountPointRef {
-            path: self.path.clone(),
-            name: self.name.clone(),
-            fs: self.fs.as_deref(),
+    /// Deep-clone this node and all descendants, sharing the mounted `Arc<dyn FileSystem>`
+    /// values but creating a new independent tree topology.
+    fn deep_clone(self: &Arc<Self>) -> Arc<Self> {
+        let fs = self.mount.read().unwrap().clone();
+        let new_node = MountNode {
+            mount: RwLock::new(fs),
+            children: DashMap::new(),
+        };
+        for entry in self.children.iter() {
+            new_node
+                .children
+                .insert(entry.key().clone(), entry.value().deep_clone());
+        }
+        Arc::new(new_node)
+    }
+
+    /// Mount `fs` at the path described by `components` relative to this node.
+    fn mount_at(
+        &self,
+        components: &[OsString],
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> Result<()> {
+        if components.is_empty() {
+            let mut lock = self.mount.write().unwrap();
+            if lock.is_some() {
+                return Err(FsError::AlreadyExists);
+            }
+            *lock = Some(fs);
+            Ok(())
+        } else {
+            // Get-or-create the child node, clone its Arc, then release the
+            // DashMap shard lock before recursing.
+            let child = {
+                let entry_ref = self
+                    .children
+                    .entry(components[0].clone())
+                    .or_insert_with(|| Arc::new(MountNode::new()));
+                Arc::clone(&*entry_ref)
+            };
+            child.mount_at(&components[1..], fs)
         }
     }
 }
 
-/// Allows different filesystems of different types
-/// to be mounted at various mount points
-#[derive(Debug, Default)]
-pub struct UnionFileSystem {
-    pub mounts: DashMap<PathBuf, MountPoint>,
+/// A filesystem that manages a tree of mount points.
+///
+/// `MountFileSystem` owns mount-point topology: which filesystem is mounted at
+/// which path, how path resolution crosses mount boundaries, and how directory
+/// listings expose sub-mounts.  Leaf filesystems (`mem_fs`, `host_fs`,
+/// `WebcVolumeFileSystem`, …) only need to implement operations for their own
+/// trees.
+///
+/// Path resolution always delegates to the *deepest* mounted node, so nested
+/// mounts work even when an intermediate leaf filesystem does not implement
+/// `mount()`.
+///
+/// Concurrent reads are lock-free at the tree level: each node holds an
+/// `RwLock` only for its own `mount` slot, and `DashMap` shards are released
+/// before any recursion.
+#[derive(Clone)]
+pub struct MountFileSystem {
+    root: Arc<MountNode>,
 }
 
-/// Defines how to handle conflicts when merging two UnionFileSystems
+impl std::fmt::Debug for MountFileSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountFileSystem")
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl Default for MountFileSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Backward-compatible alias.  New code should prefer `MountFileSystem`.
+pub type UnionFileSystem = MountFileSystem;
+
+/// Defines how to handle conflicts when merging two [`MountFileSystem`]s.
 #[derive(Clone, Copy, Debug)]
 pub enum UnionMergeMode {
-    /// Replace existing nodes with the new ones.
+    /// Replace existing mount slots with the incoming ones.
     Replace,
-    /// Skip conflicting nodes, and keep the existing ones.
+    /// Keep existing mount slots; skip the incoming ones silently.
     Skip,
-    /// Return an error if a conflict is found.
+    /// Return [`FsError::AlreadyExists`] if a conflict is found.
     Fail,
 }
 
-impl UnionFileSystem {
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn normalize_path_components(path: &Path) -> Vec<OsString> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_os_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn directory_metadata() -> Metadata {
+    Metadata {
+        ft: FileType::new_dir(),
+        accessed: 0,
+        created: 0,
+        modified: 0,
+        len: 0,
+    }
+}
+
+fn rebase_entries(entries: &mut ReadDir, prefix: &Path) {
+    for entry in &mut entries.data {
+        let suffix: PathBuf = entry.path.components().skip(1).collect();
+        entry.path = prefix.join(suffix);
+    }
+}
+
+// ── MountFileSystem impl ──────────────────────────────────────────────────────
+
+impl MountFileSystem {
     pub fn new() -> Self {
-        Self::default()
+        MountFileSystem {
+            root: Arc::new(MountNode::new()),
+        }
     }
 
+    /// Clear all mounts, replacing the root with a fresh empty node.
     pub fn clear(&mut self) {
-        self.mounts.clear();
+        self.root = Arc::new(MountNode::new());
     }
 
-    fn root_key() -> PathBuf {
-        PathBuf::from("/")
-    }
-
-    fn prepare_path(&self, path: &Path) -> PathBuf {
-        path.strip_prefix(Path::new("/")).unwrap_or(path).to_owned()
-    }
-
-    fn directory_metadata() -> Metadata {
-        Metadata {
-            ft: FileType::new_dir(),
-            accessed: 0,
-            created: 0,
-            modified: 0,
-            len: 0,
+    /// Create an independent copy of this filesystem's mount topology.
+    ///
+    /// The returned filesystem shares the same leaf `Arc<dyn FileSystem>`
+    /// values (the filesystems themselves are shared) but has a completely
+    /// independent mount tree, so adding or removing mounts in one copy does
+    /// not affect the other.
+    ///
+    /// This differs from [`Clone`], which produces a shallow copy that shares
+    /// the same root node.
+    pub fn duplicate(&self) -> Self {
+        MountFileSystem {
+            root: self.root.deep_clone(),
         }
     }
 
-    fn root_mount(&self) -> Option<MountPoint> {
-        self.mounts.get(&Self::root_key()).map(|mount| mount.clone())
+    /// Merge `other` into `self` according to `mode`.
+    pub fn merge(&self, other: &MountFileSystem, mode: UnionMergeMode) -> Result<()> {
+        Self::merge_nodes(&self.root, &other.root, mode)
     }
 
-    fn visible_child_names(&self) -> HashSet<OsString> {
-        self.mounts
-            .iter()
-            .filter_map(|entry| {
-                if entry.key().as_path() == Path::new("/") {
-                    None
-                } else {
-                    Some(entry.key().as_os_str().to_os_string())
-                }
-            })
-            .collect()
-    }
-
-    fn exact_mount(&self, path: PathBuf) -> Option<MountPoint> {
-        let path = self.prepare_path(&path);
-
-        if path.as_os_str().is_empty() {
-            return self.root_mount();
-        }
-
-        let mut components = path.components().collect::<Vec<_>>();
-        let current = components.first().copied()?;
-        components.remove(0);
-
-        let mount = self.mounts.get(&PathBuf::from(current.as_os_str()))?;
-        let mount = mount.clone();
-
-        if components.is_empty() {
-            Some(mount)
-        } else {
-            mount.children.as_ref()?.exact_mount(PathBuf::from("/").join(
-                components.into_iter().collect::<PathBuf>(),
-            ))
-        }
-    }
-
-    /// Merge another UnionFileSystem into this one.
-    pub fn merge(&self, other: &UnionFileSystem, mode: UnionMergeMode) -> Result<()> {
-        for item in other.mounts.iter() {
-            let merged = if let Some(existing) = self.mounts.get(item.key()) {
-                let mut merged = existing.clone();
-
-                match (&merged.fs, &item.value().fs) {
-                    (Some(_), Some(_)) => match mode {
+    fn merge_nodes(dest: &MountNode, src: &MountNode, mode: UnionMergeMode) -> Result<()> {
+        // Merge the mount slot.
+        {
+            let src_guard = src.mount.read().unwrap();
+            if let Some(src_fs) = src_guard.as_ref() {
+                let mut dest_guard = dest.mount.write().unwrap();
+                match dest_guard.as_ref() {
+                    Some(_) => match mode {
                         UnionMergeMode::Replace => {
-                            merged.fs = item.value().fs.clone();
-                            merged.name = item.value().name.clone();
+                            *dest_guard = Some(Arc::clone(src_fs));
                         }
                         UnionMergeMode::Skip => {
                             tracing::debug!(
-                                path = %item.key().display(),
-                                "skipping existing mount point while merging two union file systems"
+                                "skipping existing mount point while merging two filesystems"
                             );
                         }
                         UnionMergeMode::Fail => return Err(FsError::AlreadyExists),
                     },
-                    (None, Some(_)) => {
-                        merged.fs = item.value().fs.clone();
-                        merged.name = item.value().name.clone();
+                    None => {
+                        *dest_guard = Some(Arc::clone(src_fs));
                     }
-                    _ => {}
                 }
+            }
+        }
 
-                match (&merged.children, &item.value().children) {
-                    (Some(existing_children), Some(other_children)) => {
-                        existing_children.merge(other_children, mode)?;
-                    }
-                    (None, Some(other_children)) => {
-                        merged.children = Some(Arc::new(other_children.duplicate()));
-                    }
-                    _ => {}
-                }
+        // Collect src children before recursing to avoid holding DashMap
+        // references across recursive calls.
+        let src_children: Vec<(OsString, Arc<MountNode>)> = src
+            .children
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
 
-                merged
-            } else {
-                item.value().clone()
+        for (name, src_child) in src_children {
+            let dest_child = {
+                let entry_ref = dest
+                    .children
+                    .entry(name)
+                    .or_insert_with(|| Arc::new(MountNode::new()));
+                Arc::clone(&*entry_ref)
             };
-
-            self.mounts.insert(item.key().clone(), merged);
+            Self::merge_nodes(&dest_child, &src_child, mode)?;
         }
 
         Ok(())
     }
 
-    /// Duplicate this UnionFileSystem.
-    ///
-    /// This differs from the Clone implementation in that it creates a new
-    /// underlying shared map.
-    /// Clone just does a shallow copy.
-    pub fn duplicate(&self) -> Self {
-        let mounts = DashMap::new();
-
-        for item in self.mounts.iter() {
-            mounts.insert(item.key().clone(), item.value().clone());
-        }
-
-        Self { mounts }
-    }
-}
-
-impl UnionFileSystem {
-    #[allow(clippy::type_complexity)]
-    fn resolve_mount(
+    /// Walk the mount tree and find the deepest mounted node whose path is a
+    /// prefix of `path`.  Returns the delegated filesystem and the suffix
+    /// path to use within it.
+    fn resolve_deepest_mount(
         &self,
-        path: PathBuf,
-    ) -> Option<(PathBuf, PathBuf, Arc<dyn FileSystem + Send + Sync>)> {
-        let path = self.prepare_path(&path);
+        path: &Path,
+    ) -> Option<(Arc<dyn FileSystem + Send + Sync>, PathBuf)> {
+        let components = normalize_path_components(path);
+        let mut best_fs: Option<Arc<dyn FileSystem + Send + Sync>> = None;
+        let mut best_consumed: usize = 0;
 
-        let root_mount = self.root_mount().and_then(|mount| {
-            mount.fs.map(|fs| {
-                (
-                    PathBuf::from("/"),
-                    PathBuf::from("/").join(path.clone()),
-                    fs,
-                )
-            })
-        });
-
-        let mut components = path.components().collect::<Vec<_>>();
-        let current = match components.first().copied() {
-            Some(component) => component,
-            None => return root_mount,
-        };
-        components.remove(0);
-        let remainder = components.into_iter().collect::<PathBuf>();
-
-        let mount = self.mounts.get(&PathBuf::from(current.as_os_str()))?;
-        let mount = mount.clone();
-
-        if let Some(children) = &mount.children
-            && let Some((child_prefix, child_path, fs)) =
-                children.resolve_mount(PathBuf::from("/").join(remainder.clone()))
+        // Check root node.
         {
-            let child_suffix = child_prefix
-                .strip_prefix(Path::new("/"))
-                .unwrap_or(child_prefix.as_path());
-            return Some((
-                PathBuf::from("/").join(PathBuf::from(current.as_os_str()).join(child_suffix)),
-                child_path,
-                fs,
-            ));
+            let guard = self.root.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
+                best_fs = Some(Arc::clone(fs));
+                best_consumed = 0;
+            }
         }
 
-        if let Some(fs) = mount.fs {
-            return Some((
-                PathBuf::from("/").join(PathBuf::from(current.as_os_str())),
-                PathBuf::from("/").join(remainder),
-                fs,
-            ));
-        }
-
-        root_mount
-    }
-
-    fn rebase_entries(entries: &mut ReadDir, prefix: &Path) {
-        for entry in &mut entries.data {
-            let suffix: PathBuf = entry.path.components().skip(1).collect();
-            entry.path = prefix.join(suffix);
-        }
-    }
-
-    fn read_dir_from_exact_mount(&self, prefix: &Path, mount: &MountPoint) -> Result<ReadDir> {
-        let child_names: HashSet<_> = mount
-            .children
-            .as_ref()
-            .map(|children| children.visible_child_names())
-            .unwrap_or_default();
-        let mut entries = Vec::new();
-
-        if let Some(fs) = &mount.fs {
-            let mut base_entries = fs.read_dir(Path::new("/"))?;
-            Self::rebase_entries(&mut base_entries, prefix);
-            entries.extend(base_entries.data.into_iter().filter(|entry| {
-                entry
-                    .path
-                    .file_name()
-                    .map(|name| !child_names.contains(name))
-                    .unwrap_or(true)
-            }));
-        }
-
-        entries.extend(child_names.into_iter().map(|name| DirEntry {
-            path: prefix.join(PathBuf::from(name)),
-            metadata: Ok(Self::directory_metadata()),
-        }));
-
-        Ok(ReadDir::new(entries))
-    }
-}
-
-impl FileSystem for UnionFileSystem {
-    fn readlink(&self, path: &Path) -> Result<PathBuf> {
-        let path = self.prepare_path(path);
-
-        if path.as_os_str().is_empty() {
-            Err(FsError::NotAFile)
-        } else {
-            if let Some(mount) = self.exact_mount(path.clone()) {
-                if mount.fs.is_none() {
-                    return Err(FsError::EntryNotFound);
+        let mut node = Arc::clone(&self.root);
+        for (i, component) in components.iter().enumerate() {
+            // Clone the Arc and release the DashMap lock before the next
+            // iteration so we never hold two shard locks simultaneously.
+            let child = node
+                .children
+                .get(component.as_os_str())
+                .map(|r| Arc::clone(r.value()));
+            match child {
+                None => break,
+                Some(child_node) => {
+                    {
+                        let guard = child_node.mount.read().unwrap();
+                        if let Some(fs) = guard.as_ref() {
+                            best_fs = Some(Arc::clone(fs));
+                            best_consumed = i + 1;
+                        }
+                    }
+                    node = child_node;
                 }
             }
+        }
 
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => fs.readlink(&path),
-                _ => Err(FsError::EntryNotFound),
+        best_fs.map(|fs| {
+            let remaining: PathBuf = components[best_consumed..].iter().collect();
+            (fs, Path::new("/").join(remaining))
+        })
+    }
+
+    /// Find the exact `MountNode` for `path`, if one exists in the tree.
+    fn find_node(&self, path: &Path) -> Option<Arc<MountNode>> {
+        let components = normalize_path_components(path);
+        let mut node = Arc::clone(&self.root);
+
+        for component in &components {
+            let child = node
+                .children
+                .get(component.as_os_str())
+                .map(|r| Arc::clone(r.value()));
+            match child {
+                None => return None,
+                Some(child_node) => node = child_node,
             }
+        }
+
+        Some(node)
+    }
+}
+
+// ── FileSystem trait ──────────────────────────────────────────────────────────
+
+impl FileSystem for MountFileSystem {
+    fn readlink(&self, path: &Path) -> Result<PathBuf> {
+        match self.resolve_deepest_mount(path) {
+            Some((fs, delegated)) => fs.readlink(&delegated),
+            None => Err(FsError::EntryNotFound),
         }
     }
 
     fn read_dir(&self, path: &Path) -> Result<ReadDir> {
-        let path = self.prepare_path(path);
+        let components = normalize_path_components(path);
+        let prefix = PathBuf::from("/").join(components.iter().collect::<PathBuf>());
 
-        if path.as_os_str().is_empty() {
-            let mut entries = Vec::new();
-            let child_names = self.visible_child_names();
+        match self.find_node(path) {
+            Some(node) => {
+                // Exact node found: merge the mounted fs's root entries with
+                // the names of any child sub-mounts.  Child mount names shadow
+                // same-named entries from the base filesystem.
+                let child_names: HashSet<OsString> =
+                    node.children.iter().map(|e| e.key().clone()).collect();
+                let mut entries = Vec::new();
 
-            if let Some(root_mount) = self.root_mount()
-                && let Some(fs) = root_mount.fs
-            {
-                let mut base_entries = fs.read_dir(Path::new("/"))?;
-                Self::rebase_entries(&mut base_entries, Path::new("/"));
-                entries.extend(base_entries.data.into_iter().filter(|entry| {
-                    entry
-                        .path
-                        .file_name()
-                        .map(|name| !child_names.contains(name))
-                        .unwrap_or(true)
-                }));
-            }
-
-            entries.extend(child_names.into_iter().map(|name| DirEntry {
-                path: PathBuf::from("/").join(PathBuf::from(name)),
-                metadata: Ok(Self::directory_metadata()),
-            }));
-
-            Ok(ReadDir::new(entries))
-        } else if let Some(mount) = self.exact_mount(path.clone()) {
-            self.read_dir_from_exact_mount(&PathBuf::from("/").join(&path), &mount)
-        } else {
-            match self.resolve_mount(path.to_owned()) {
-                Some((prefix, path, fs)) => {
-                    let mut entries = fs.read_dir(&path)?;
-                    Self::rebase_entries(&mut entries, &prefix);
-                    Ok(entries)
+                {
+                    let guard = node.mount.read().unwrap();
+                    if let Some(fs) = guard.as_ref() {
+                        let mut base = fs.read_dir(Path::new("/"))?;
+                        rebase_entries(&mut base, &prefix);
+                        entries.extend(base.data.into_iter().filter(|entry| {
+                            entry
+                                .path
+                                .file_name()
+                                .map(|n| !child_names.contains(n))
+                                .unwrap_or(true)
+                        }));
+                    }
                 }
-                _ => Err(FsError::EntryNotFound),
+
+                entries.extend(child_names.into_iter().map(|name| DirEntry {
+                    path: prefix.join(PathBuf::from(&name)),
+                    metadata: Ok(directory_metadata()),
+                }));
+
+                Ok(ReadDir::new(entries))
+            }
+            None => {
+                // Path is not a mount-tree node; delegate to the deepest mount.
+                match self.resolve_deepest_mount(path) {
+                    Some((fs, delegated)) => {
+                        let mut entries = fs.read_dir(&delegated)?;
+                        rebase_entries(&mut entries, &prefix);
+                        Ok(entries)
+                    }
+                    None => Err(FsError::EntryNotFound),
+                }
             }
         }
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
-        let path = self.prepare_path(path);
+        let components = normalize_path_components(path);
 
-        if path.as_os_str().is_empty() {
-            Ok(())
-        } else if let Some(mount) = self.exact_mount(path.clone()) {
-            if let Some(fs) = mount.fs {
-                let result = fs.create_dir(Path::new("/"));
+        if components.is_empty() {
+            // Creating the virtual root is always a no-op.
+            return Ok(());
+        }
 
-                if let Err(e) = result
-                    && e == FsError::AlreadyExists
-                {
-                    return Ok(());
+        if let Some(node) = self.find_node(path) {
+            let guard = node.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
+                match fs.create_dir(Path::new("/")) {
+                    Err(FsError::AlreadyExists) => Ok(()),
+                    other => other,
                 }
-
-                result
             } else {
+                // Branch-only node: the directory implicitly exists.
                 Ok(())
             }
         } else {
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => {
-                    let result = fs.create_dir(&path);
-
-                    if let Err(e) = result
-                        && e == FsError::AlreadyExists
-                    {
-                        return Ok(());
-                    }
-
-                    result
-                }
-                _ => Err(FsError::EntryNotFound),
+            match self.resolve_deepest_mount(path) {
+                Some((fs, delegated)) => match fs.create_dir(&delegated) {
+                    Err(FsError::AlreadyExists) => Ok(()),
+                    other => other,
+                },
+                None => Err(FsError::EntryNotFound),
             }
         }
     }
-    fn remove_dir(&self, path: &Path) -> Result<()> {
-        let path = self.prepare_path(path);
 
-        if path.as_os_str().is_empty() {
-            Err(FsError::PermissionDenied)
-        } else if let Some(mount) = self.exact_mount(path.clone()) {
-            if mount.children.is_some() {
-                Err(FsError::PermissionDenied)
-            } else if let Some(fs) = mount.fs {
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        let components = normalize_path_components(path);
+
+        if components.is_empty() {
+            return Err(FsError::PermissionDenied);
+        }
+
+        if let Some(node) = self.find_node(path) {
+            if !node.children.is_empty() {
+                // Refuse to remove a node that still has child mounts.
+                return Err(FsError::PermissionDenied);
+            }
+            let guard = node.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
                 fs.remove_dir(Path::new("/"))
             } else {
                 Err(FsError::EntryNotFound)
             }
         } else {
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => fs.remove_dir(&path),
-                _ => Err(FsError::EntryNotFound),
+            match self.resolve_deepest_mount(path) {
+                Some((fs, delegated)) => fs.remove_dir(&delegated),
+                None => Err(FsError::EntryNotFound),
             }
         }
     }
+
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let from = self.prepare_path(from);
-            let to = self.prepare_path(to);
+            let from_components = normalize_path_components(from);
 
-            if from.as_os_str().is_empty() {
-                Err(FsError::PermissionDenied)
-            } else {
-                if let Some(mount) = self.exact_mount(from.clone())
-                    && (mount.fs.is_none() || mount.children.is_some())
-                {
+            if from_components.is_empty() {
+                return Err(FsError::PermissionDenied);
+            }
+
+            // Refuse to rename a mount-tree node that is branch-only or has
+            // child mounts.
+            if let Some(node) = self.find_node(from) {
+                let has_children = !node.children.is_empty();
+                let guard = node.mount.read().unwrap();
+                if guard.is_none() || has_children {
                     return Err(FsError::PermissionDenied);
                 }
+            }
 
-                match (self.resolve_mount(from.to_owned()), self.resolve_mount(to.to_owned())) {
-                    (Some((from_prefix, from_path, fs)), Some((to_prefix, to_path, _)))
-                        if from_prefix == to_prefix =>
-                    {
-                        fs.rename(&from_path, &to_path).await
-                    }
-                    (Some(_), Some(_)) => Err(FsError::InvalidInput),
-                    _ => Err(FsError::EntryNotFound),
+            match (
+                self.resolve_deepest_mount(from),
+                self.resolve_deepest_mount(to),
+            ) {
+                // Two paths are in the same mounted filesystem when they
+                // resolve to the same Arc pointer.  Each `mount()` call
+                // stores exactly one Arc per mount slot, so paths under the
+                // same mount always produce the same pointer.  Cross-mount
+                // renames are rejected with InvalidInput.
+                (Some((from_fs, from_path)), Some((to_fs, to_path)))
+                    if Arc::ptr_eq(&from_fs, &to_fs) =>
+                {
+                    from_fs.rename(&from_path, &to_path).await
                 }
+                (Some(_), Some(_)) => Err(FsError::InvalidInput),
+                _ => Err(FsError::EntryNotFound),
             }
         })
     }
+
     fn metadata(&self, path: &Path) -> Result<Metadata> {
-        let path = self.prepare_path(path);
+        let components = normalize_path_components(path);
 
-        if path.as_os_str().is_empty() {
-            if let Some(root_mount) = self.root_mount()
-                && let Some(fs) = root_mount.fs
-            {
+        if components.is_empty() {
+            let guard = self.root.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
                 fs.metadata(Path::new("/"))
             } else {
-                Ok(Self::directory_metadata())
+                Ok(directory_metadata())
             }
-        } else if let Some(mount) = self.exact_mount(path.clone()) {
-            if let Some(fs) = mount.fs {
+        } else if let Some(node) = self.find_node(path) {
+            let guard = node.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
                 fs.metadata(Path::new("/"))
-            } else if mount.children.is_some() {
-                Ok(Self::directory_metadata())
             } else {
-                Err(FsError::EntryNotFound)
+                // Branch-only node: synthetic directory metadata.
+                Ok(directory_metadata())
             }
         } else {
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => fs.metadata(&path),
-                _ => Err(FsError::EntryNotFound),
+            match self.resolve_deepest_mount(path) {
+                Some((fs, delegated)) => fs.metadata(&delegated),
+                None => Err(FsError::EntryNotFound),
             }
         }
     }
+
     fn symlink_metadata(&self, path: &Path) -> Result<Metadata> {
-        let path = self.prepare_path(path);
+        let components = normalize_path_components(path);
 
-        if path.as_os_str().is_empty() {
-            if let Some(root_mount) = self.root_mount()
-                && let Some(fs) = root_mount.fs
-            {
+        if components.is_empty() {
+            let guard = self.root.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
                 fs.symlink_metadata(Path::new("/"))
             } else {
-                Ok(Self::directory_metadata())
+                Ok(directory_metadata())
             }
-        } else if let Some(mount) = self.exact_mount(path.clone()) {
-            if let Some(fs) = mount.fs {
+        } else if let Some(node) = self.find_node(path) {
+            let guard = node.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
                 fs.symlink_metadata(Path::new("/"))
-            } else if mount.children.is_some() {
-                Ok(Self::directory_metadata())
             } else {
-                Err(FsError::EntryNotFound)
+                Ok(directory_metadata())
             }
         } else {
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => fs.symlink_metadata(&path),
-                _ => Err(FsError::EntryNotFound),
+            match self.resolve_deepest_mount(path) {
+                Some((fs, delegated)) => fs.symlink_metadata(&delegated),
+                None => Err(FsError::EntryNotFound),
             }
         }
     }
-    fn remove_file(&self, path: &Path) -> Result<()> {
-        let path = self.prepare_path(path);
 
-        if path.as_os_str().is_empty() {
-            Err(FsError::NotAFile)
-        } else if let Some(mount) = self.exact_mount(path.clone()) {
-            if mount.children.is_some() {
-                Err(FsError::PermissionDenied)
-            } else if let Some(fs) = mount.fs {
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        let components = normalize_path_components(path);
+
+        if components.is_empty() {
+            return Err(FsError::NotAFile);
+        }
+
+        if let Some(node) = self.find_node(path) {
+            if !node.children.is_empty() {
+                return Err(FsError::PermissionDenied);
+            }
+            let guard = node.mount.read().unwrap();
+            if let Some(fs) = guard.as_ref() {
                 fs.remove_file(Path::new("/"))
             } else {
                 Err(FsError::EntryNotFound)
             }
         } else {
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => fs.remove_file(&path),
-                _ => Err(FsError::EntryNotFound),
+            match self.resolve_deepest_mount(path) {
+                Some((fs, delegated)) => fs.remove_file(&delegated),
+                None => Err(FsError::EntryNotFound),
             }
         }
     }
+
     fn new_open_options(&self) -> OpenOptions<'_> {
         OpenOptions::new(self)
     }
 
     fn mount(
         &self,
-        name: String,
+        // The `name` parameter is part of the `FileSystem` trait signature and
+        // retained for backward compatibility.  `MountFileSystem` does not
+        // store names; mount topology is keyed by path alone.
+        _name: String,
         path: &Path,
         fs: Box<dyn FileSystem + Send + Sync>,
     ) -> Result<()> {
-        let path = self.prepare_path(path);
-
-        if path.as_os_str().is_empty() {
-            if let Some(existing) = self.mounts.get(&Self::root_key())
-                && existing.fs.is_some()
-            {
+        let components = normalize_path_components(path);
+        if components.is_empty() {
+            // Mounting at root.
+            let mut guard = self.root.mount.write().unwrap();
+            if guard.is_some() {
                 return Err(FsError::AlreadyExists);
             }
-
-            let mut mount = self.root_mount().unwrap_or(MountPoint {
-                path: Self::root_key(),
-                name: name.clone(),
-                fs: None,
-                children: None,
-            });
-            mount.name = name;
-            mount.fs = Some(Arc::from(fs));
-            self.mounts.insert(Self::root_key(), mount);
-            return Ok(());
-        }
-
-        let mut components = path.components().collect::<Vec<_>>();
-        if let Some(c) = components.first().copied() {
-            components.remove(0);
-
-            let sub_path = components.into_iter().collect::<PathBuf>();
-
-            if let Some(existing) = self.mounts.get(&PathBuf::from(c.as_os_str())) {
-                let mut mount = existing.clone();
-                drop(existing);
-
-                if sub_path.components().next().is_none() {
-                    if mount.fs.is_some() {
-                        return Err(FsError::AlreadyExists);
-                    }
-
-                    mount.name = name;
-                    mount.fs = Some(Arc::from(fs));
-                } else {
-                    let children = mount
-                        .children
-                        .clone()
-                        .unwrap_or_else(|| Arc::new(UnionFileSystem::new()));
-                    children.mount(name, sub_path.as_path(), fs)?;
-                    mount.children = Some(children);
-                }
-
-                self.mounts.insert(PathBuf::from(c.as_os_str()), mount);
-                return Ok(());
-            }
-
-            let mut mount = MountPoint {
-                path: PathBuf::from(c.as_os_str()),
-                name,
-                fs: None,
-                children: None,
-            };
-
-            if sub_path.components().next().is_none() {
-                mount.fs = Some(Arc::from(fs));
-            } else {
-                let children = Arc::new(UnionFileSystem::new());
-                children.mount(mount.name.clone(), sub_path.as_path(), fs)?;
-                mount.children = Some(children);
-            }
-
-            self.mounts.insert(PathBuf::from(c.as_os_str()), mount);
+            *guard = Some(Arc::from(fs));
+            Ok(())
         } else {
-            return Err(FsError::EntryNotFound);
+            self.root.mount_at(&components, Arc::from(fs))
         }
-
-        Ok(())
     }
 }
 
-#[derive(Debug)]
-pub struct MountPointRef<'a> {
-    pub path: PathBuf,
-    pub name: String,
-    pub fs: Option<&'a (dyn FileSystem + Send + Sync)>,
-}
+// ── FileOpener ────────────────────────────────────────────────────────────────
 
-impl FileOpener for UnionFileSystem {
+impl FileOpener for MountFileSystem {
     fn open(
         &self,
         path: &Path,
         conf: &OpenOptionsConfig,
     ) -> Result<Box<dyn VirtualFile + Send + Sync>> {
-        let path = self.prepare_path(path);
-
-        if path.as_os_str().is_empty() {
-            Err(FsError::NotAFile)
-        } else {
-            if let Some(mount) = self.exact_mount(path.clone())
-                && mount.fs.is_none()
-            {
+        // A branch-only mount-tree node (no mounted fs) is a virtual directory,
+        // not a file.
+        if let Some(node) = self.find_node(path) {
+            let guard = node.mount.read().unwrap();
+            if guard.is_none() {
                 return Err(FsError::NotAFile);
             }
+        }
 
-            match self.resolve_mount(path.to_owned()) {
-                Some((_, path, fs)) => fs.new_open_options().options(conf.clone()).open(path),
-                _ => Err(FsError::EntryNotFound),
-            }
+        match self.resolve_deepest_mount(path) {
+            Some((fs, delegated)) => fs.new_open_options().options(conf.clone()).open(delegated),
+            None => Err(FsError::EntryNotFound),
         }
     }
 }
@@ -610,9 +607,10 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use crate::{FileSystem as FileSystemTrait, FsError, UnionFileSystem, UnionMergeMode, mem_fs};
-
-    use super::{FileOpener, OpenOptionsConfig};
+    use crate::{
+        FileOpener, FileSystem as FileSystemTrait, FsError, OpenOptionsConfig, UnionFileSystem,
+        UnionMergeMode, mem_fs,
+    };
 
     #[derive(Debug, Clone, Default)]
     struct MountlessFileSystem {
